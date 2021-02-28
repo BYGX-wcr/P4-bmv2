@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 set -e
 git clone https://github.com/nanomsg/nnpy.git
 # top of tree won't install
