@@ -12,12 +12,12 @@ class MonitorThread(threading.Thread):
     def run(self):
         ip = IPRoute()
         ip.bind()
+        handleDict = dict()
         while True:
             message = ip.get()[0]
-            print(message)
             if message['event'] == 'RTM_NEWROUTE':
                 # add a new route entry to the ipv4 route table of p4 switch
-                
+                print("New RTM_NEWROUTE msg: ", message)
                 # define all fields in an entry
                 action = "ipv4_forward"
                 srcAddr = '0.0.0.0'
@@ -42,12 +42,31 @@ class MonitorThread(threading.Thread):
                         device_name = str(device_name).split('-')
                         port_name = device_name[1] if len(device_name) > 1 else device_name[0]
                         egress_port = int(port_name[3:])
-                entry = 'table_add Ipv4_FIB' + ' ' + action + ' ' + srcAddr + '&&&' + srcMask + ' ' + dstAddr + '/' + dstMaskLen + " => " + next_hop + ' ' + str(egress_port) + ' ' + str(priority)
+                entry = 'Ipv4_FIB' + ' ' + action + ' ' + srcAddr + '&&&' + srcMask + ' ' + dstAddr + '/' + dstMaskLen + " => " + next_hop + ' ' + str(egress_port) + ' ' + str(priority)
                 print("Add an entry: " + entry)
-                # self.runtime.do_table_add(entry)
+                handle = self.runtime.do_table_add(entry)
+                handleDict[dstAddr + '/' + dstMaskLen] = handle
             elif message['event'] == 'RTM_DELROUTE':
                 # delete an existing route entry to the ipv4 route table of p4 switch
-                pass
+                print("New RTM_DELROUTE msg: ", message)
+                dstAddr = str()
+                dstMaskLen = str(message['dst_len'])
+                
+                # parse attrs(only looking for RTA_DST)
+                attrs = message['attrs']
+                for field in attrs:
+                    if field[0] == 'RTA_DST':
+                        dstAddr = field[1]
+                
+                key = dstAddr + '/' + dstMaskLen
+                if key not in handleDict:
+                    print("Handle missing for entry: ", key)
+                else:
+                    print("Delete an entry: ", message)
+                    handle = handleDict[key]
+                    cmdLine = 'table_delete Ipv4_FIB' + ' ' + str(handle)
+                    del handleDict[key]
+                
 
 if __name__ == "__main__":
     # set up runtime API for the p4 switch
@@ -64,4 +83,3 @@ if __name__ == "__main__":
     # create monitor thread
     mt = MonitorThread(main_runtime)
     mt.start()
-    mt.join()
