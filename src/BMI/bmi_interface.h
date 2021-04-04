@@ -22,7 +22,7 @@
 #define _BMI_INTERFACE_
 
 #define INTF_ACL_LEN 5
-#define IPV4_WORDS_NUM 5
+#define IPV4_4B_NUM 5
 
 typedef struct bmi_interface_s bmi_interface_t;
 

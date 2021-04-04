@@ -22,8 +22,9 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <pthread.h>
-#include <sys/socket.h> 
-#include <sys/types.h>
+#include <linux/socket.h> 
+#include <linux/types.h>
+#include <linux/if_ether.h>
 #include <netinet/in.h>
 
 #include <pcap/pcap.h>
@@ -31,9 +32,9 @@
 
 typedef struct ac_rule {
   uint8_t valid;
-  uint32_t ipv4_vals[IPV4_WORDS_NUM];
-  uint32_t ipv4_masks[IPV4_WORDS_NUM];
-};
+  uint32_t ipv4_vals[IPV4_4B_NUM];
+  uint32_t ipv4_masks[IPV4_4B_NUM];
+} ac_rule_t;
 
 typedef struct bmi_interface_s {
   /* Original members defined by P4 community*/
@@ -43,7 +44,8 @@ typedef struct bmi_interface_s {
   pcap_dumper_t *pcap_output_dumper;
 
   /* New members added by WCR, UCLA CSD */
-  struct ac_rule drop_rule;
+  ac_rule_t drop_rule;
+  uint16_t control_port_index;
 } bmi_interface_t;
 
 static uint16_t port_base = 100819;
@@ -101,7 +103,7 @@ static void control_msg_proc(int sockfd, bmi_interface_t *bmi) {
 }
 
 static void* bmi_interface_control_thread(void *arg) {
-  bmi_interface_t *bmi_ = (bmi_interface_t *) arg;
+  bmi_interface_t *bmi = (bmi_interface_t *) arg;
   int sockfd, connfd, len;
 	struct sockaddr_in servaddr, cli; 
 
@@ -118,7 +120,7 @@ static void* bmi_interface_control_thread(void *arg) {
 	// assign IP, PORT 
 	servaddr.sin_family = AF_INET;
 	servaddr.sin_addr.s_addr = htonl(INADDR_ANY); 
-	servaddr.sin_port = htons(port_base + port_index);
+	servaddr.sin_port = htons(port_base + bmi->control_port_index);
   port_index++; 
 
 	// Binding newly created socket to given IP and verification 
@@ -132,7 +134,7 @@ static void* bmi_interface_control_thread(void *arg) {
 		printf("Listen failed...\n"); 
 		pthread_exit(0);
 	} 
-	len = sizeof(cli); 
+	len = sizeof(cli);
 
 	// Accept the data packet from client and verification
   while (1) {
@@ -143,7 +145,7 @@ static void* bmi_interface_control_thread(void *arg) {
     }
 
     // Function for chatting between client and server 
-    control_msg_proc(connfd, bmi_); 
+    control_msg_proc(connfd, bmi); 
   }
 
 	// After chatting close the socket 
@@ -198,6 +200,12 @@ int bmi_interface_create(bmi_interface_t **bmi, const char *device) {
     free(bmi_);
     return -1;
   }
+
+  /* Configure the control port */
+  char* ptr = device;
+  while (*ptr != '-') ptr++; // skip host name
+  ptr += 3; // skip prefix "eth"
+  bmi_->control_port_index = atoi(ptr);
 
   /* Set up the thread that run the control socket */
   pthread_t pt_id;
@@ -268,6 +276,33 @@ int bmi_interface_recv(bmi_interface_t *bmi, const char **data) {
   if(bmi->pcap_input_dumper) {
     pcap_dump((unsigned char *) bmi->pcap_input_dumper, pkt_header, pkt_data);
     pcap_dump_flush(bmi->pcap_input_dumper);
+  }
+
+  if (bmi->drop_rule.valid) {
+    // drop rule is valid, check the packet
+    uint16_t ether_type = 0;
+    strncpy((char *)&ether_type, pkt_data + (ETH_ALEN * 2), 2);
+    ether_type = ntohs(ether_type);
+    if (ether_type == ETH_P_IP) {
+      // ipv4 packet
+      const unsigned char *ipv4_hdr = pkt_data + (ETH_ALEN * 2) + 2;
+      int drop_flag = 1;
+      for (int i = 0; i < IPV4_4B_NUM; ++i) {
+        // check each 4 bytes word in the ipv4 header
+        uint32_t word = 0;
+        strncpy((char *)&word, ipv4_hdr + i * 32, 32);
+        word = ntohl(word) & bmi->drop_rule.ipv4_masks[i];
+        if (word != bmi->drop_rule.ipv4_vals[i]) {
+          // mismatch, disable the drop flag
+          drop_flag = 0;
+          break;
+        }
+      }
+
+      if (drop_flag) {
+        return 0;
+      }
+    }
   }
 
   *data = (const char *) pkt_data;
