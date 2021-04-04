@@ -21,21 +21,134 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <pthread.h>
+#include <sys/socket.h> 
+#include <sys/types.h>
+#include <netinet/in.h>
 
 #include <pcap/pcap.h>
 #include "bmi_interface.h"
 
+typedef struct ac_rule {
+  uint8_t valid;
+  uint32_t ipv4_vals[IPV4_WORDS_NUM];
+  uint32_t ipv4_masks[IPV4_WORDS_NUM];
+};
+
 typedef struct bmi_interface_s {
+  /* Original members defined by P4 community*/
   pcap_t *pcap;
   int fd;
   pcap_dumper_t *pcap_input_dumper;
   pcap_dumper_t *pcap_output_dumper;
+
+  /* New members added by WCR, UCLA CSD */
+  struct ac_rule drop_rule;
 } bmi_interface_t;
 
-/* static get_version(int *x, int *y, int *z) { */
-/*   const char *str = pcap_lib_version(); */
-/*   sscanf(str, "%*s %*s %d.%d.%d", x, y, z); */
-/* } */
+static uint16_t port_base = 100819;
+static uint16_t port_index = 0;
+
+static void control_msg_proc(int sockfd, bmi_interface_t *bmi) {
+  char buff[128];
+	int n;
+  bzero(buff, 128);
+
+  // read the message from client and copy it in buffer 
+  read(sockfd, buff, sizeof(buff));
+  if (strncmp(buff, "set", 3)) {
+    // set a drop rule
+
+    int ptr = 4; // starting point for L3 section
+    if (strncmp(buff + ptr, "ipv4", 4)) {
+      ptr += 4;
+      //extract IPv4 filtering criteria which consists of 5 val&&&masks strings
+      for (int i = 0; i < 5; ++i) {
+        ++ptr; // skip blank
+        int val_start = ptr, mask_start = ptr;
+        int val_end = 0, mask_end = 0;
+        while (buff[ptr] != ' ' && ptr < 128) {
+          if (buff[ptr - 1] == '&' && buff[ptr] != '&') mask_start = ptr;
+          if (buff[ptr + 1] == '&' && buff[ptr] != '&') val_end = ptr;
+          ++ptr;
+        }
+        mask_end = ptr - 1;
+        
+        if (ptr == 128 || mask_start == val_start) {
+          printf("Recv a message in incorrect format: %s", buff);
+        }
+
+        char val[20];
+        char mask[20];
+        bzero(val, 20);
+        bzero(mask, 20);
+
+        strncpy(val, buff + val_start, (val_end - val_start) + 1);
+        strncpy(mask, buff + mask_start, (mask_end - mask_start) + 1);
+        uint32_t mask_bs = strtol(mask, NULL, 16); // bit string of mask
+        uint32_t val_bs = strtol(val, NULL, 16) & mask_bs; // bit string of val
+        bmi->drop_rule.ipv4_masks[i] = mask_bs;
+        bmi->drop_rule.ipv4_vals[i] = val_bs;
+      }
+    }
+
+    bmi->drop_rule.valid = 1;
+  }
+  else if (strncmp(buff, "unset", 3)) {
+    // unset the drop rule
+    bmi->drop_rule.valid = 0;
+  }
+}
+
+static void* bmi_interface_control_thread(void *arg) {
+  bmi_interface_t *bmi_ = (bmi_interface_t *) arg;
+  int sockfd, connfd, len;
+	struct sockaddr_in servaddr, cli; 
+
+	// socket create and verification 
+	sockfd = socket(AF_INET, SOCK_STREAM, 0); 
+	if (sockfd == -1) { 
+		printf("socket creation failed...\n"); 
+		pthread_exit(0); 
+	} 
+	else
+		printf("Socket successfully created..\n"); 
+	bzero(&servaddr, sizeof(servaddr)); 
+
+	// assign IP, PORT 
+	servaddr.sin_family = AF_INET;
+	servaddr.sin_addr.s_addr = htonl(INADDR_ANY); 
+	servaddr.sin_port = htons(port_base + port_index);
+  port_index++; 
+
+	// Binding newly created socket to given IP and verification 
+	if ((bind(sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr))) != 0) { 
+		printf("Socket bind failed...\n"); 
+		pthread_exit(0);
+	} 
+
+	// Now server is ready to listen and verification 
+	if ((listen(sockfd, 5)) != 0) { 
+		printf("Listen failed...\n"); 
+		pthread_exit(0);
+	} 
+	len = sizeof(cli); 
+
+	// Accept the data packet from client and verification
+  while (1) {
+    connfd = accept(sockfd, (struct sockaddr*)&cli, &len); 
+    if (connfd < 0) { 
+      printf("Server acccept failed...\n"); 
+      continue;
+    }
+
+    // Function for chatting between client and server 
+    control_msg_proc(connfd, bmi_); 
+  }
+
+	// After chatting close the socket 
+	close(sockfd); 
+}
 
 int bmi_interface_create(bmi_interface_t **bmi, const char *device) {
   bmi_interface_t *bmi_ = malloc(sizeof(bmi_interface_t));
@@ -82,6 +195,15 @@ int bmi_interface_create(bmi_interface_t **bmi, const char *device) {
   bmi_->fd = pcap_get_selectable_fd(bmi_->pcap);
   if(bmi_->fd < 0) {
     pcap_close(bmi_->pcap);
+    free(bmi_);
+    return -1;
+  }
+
+  /* Set up the thread that run the control socket */
+  pthread_t pt_id;
+  if (pthread_create(&pt_id, NULL, &bmi_interface_control_thread, (void *)bmi_) != 0) {
+    pcap_close(bmi_->pcap);
+    printf("Cannot set up control thread!\n");
     free(bmi_);
     return -1;
   }
