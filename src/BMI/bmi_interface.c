@@ -22,6 +22,9 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <pthread.h>
+#include <assert.h>
+#include <ctype.h>
+#include <unistd.h>
 #include <linux/socket.h> 
 #include <linux/types.h>
 #include <linux/if_ether.h>
@@ -48,8 +51,7 @@ typedef struct bmi_interface_s {
   uint16_t control_port_index;
 } bmi_interface_t;
 
-static uint16_t port_base = 100819;
-static uint16_t port_index = 0;
+static uint16_t port_base = 10819;
 
 static void control_msg_proc(int sockfd, bmi_interface_t *bmi) {
   char buff[128];
@@ -58,18 +60,20 @@ static void control_msg_proc(int sockfd, bmi_interface_t *bmi) {
 
   // read the message from client and copy it in buffer 
   read(sockfd, buff, sizeof(buff));
-  if (strncmp(buff, "set", 3)) {
+  printf("Recv a new control message: %s\n", buff);
+  if (strncmp(buff, "set", 3) == 0) {
+    printf("Recv a set\n");
     // set a drop rule
 
     int ptr = 4; // starting point for L3 section
-    if (strncmp(buff + ptr, "ipv4", 4)) {
+    if (strncmp(buff + ptr, "ipv4", 4) == 0) {
       ptr += 4;
       //extract IPv4 filtering criteria which consists of 5 val&&&masks strings
       for (int i = 0; i < 5; ++i) {
         ++ptr; // skip blank
         int val_start = ptr, mask_start = ptr;
         int val_end = 0, mask_end = 0;
-        while (buff[ptr] != ' ' && ptr < 128) {
+        while (buff[ptr] != ' ' && ptr < strlen(buff)) {
           if (buff[ptr - 1] == '&' && buff[ptr] != '&') mask_start = ptr;
           if (buff[ptr + 1] == '&' && buff[ptr] != '&') val_end = ptr;
           ++ptr;
@@ -77,7 +81,8 @@ static void control_msg_proc(int sockfd, bmi_interface_t *bmi) {
         mask_end = ptr - 1;
         
         if (ptr == 128 || mask_start == val_start) {
-          printf("Recv a message in incorrect format: %s", buff);
+          printf("Recv a message in incorrect format: %s\n", buff);
+          return;
         }
 
         char val[20];
@@ -91,12 +96,15 @@ static void control_msg_proc(int sockfd, bmi_interface_t *bmi) {
         uint32_t val_bs = strtol(val, NULL, 16) & mask_bs; // bit string of val
         bmi->drop_rule.ipv4_masks[i] = mask_bs;
         bmi->drop_rule.ipv4_vals[i] = val_bs;
+        printf("finish processing word %d\n", i);
       }
+      printf("Install a new rule\n");
     }
 
     bmi->drop_rule.valid = 1;
   }
-  else if (strncmp(buff, "unset", 3)) {
+  else if (strncmp(buff, "unset", 5) == 0) {
+    printf("Recv an unset\n");
     // unset the drop rule
     bmi->drop_rule.valid = 0;
   }
@@ -107,31 +115,36 @@ static void* bmi_interface_control_thread(void *arg) {
   int sockfd, connfd, len;
 	struct sockaddr_in servaddr, cli; 
 
+  // initialize the rule
+  bzero(&bmi->drop_rule, sizeof(bmi->drop_rule));
+
 	// socket create and verification 
 	sockfd = socket(AF_INET, SOCK_STREAM, 0); 
 	if (sockfd == -1) { 
-		printf("socket creation failed...\n"); 
+		printf("Socket creation failed...\n"); 
+    perror("create");
 		pthread_exit(0); 
 	} 
 	else
 		printf("Socket successfully created..\n"); 
 	bzero(&servaddr, sizeof(servaddr)); 
 
-	// assign IP, PORT 
+	// assign IP, PORT
 	servaddr.sin_family = AF_INET;
 	servaddr.sin_addr.s_addr = htonl(INADDR_ANY); 
 	servaddr.sin_port = htons(port_base + bmi->control_port_index);
-  port_index++; 
 
 	// Binding newly created socket to given IP and verification 
 	if ((bind(sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr))) != 0) { 
-		printf("Socket bind failed...\n"); 
+		printf("Socket bind failed...\n");
+		perror("bind");
 		pthread_exit(0);
 	} 
 
 	// Now server is ready to listen and verification 
 	if ((listen(sockfd, 5)) != 0) { 
 		printf("Listen failed...\n"); 
+		perror("listen");
 		pthread_exit(0);
 	} 
 	len = sizeof(cli);
@@ -141,11 +154,14 @@ static void* bmi_interface_control_thread(void *arg) {
     connfd = accept(sockfd, (struct sockaddr*)&cli, &len); 
     if (connfd < 0) { 
       printf("Server acccept failed...\n"); 
+      perror("accept");
       continue;
     }
 
     // Function for chatting between client and server 
     control_msg_proc(connfd, bmi); 
+
+    close(connfd);
   }
 
 	// After chatting close the socket 
@@ -164,11 +180,13 @@ int bmi_interface_create(bmi_interface_t **bmi, const char *device) {
   bmi_->pcap = pcap_create(device, errbuf);
 
   if(!bmi_->pcap) {
+    printf("Cannot create pcap interface: %s!\n", device);
     free(bmi_);
     return -1;
   }
 
   if(pcap_set_promisc(bmi_->pcap, 1) != 0) {
+    printf("Cannot set promiscuous mode for pcap interface: %s!\n", device);
     pcap_close(bmi_->pcap);
     free(bmi_);
     return -1;
@@ -189,6 +207,7 @@ int bmi_interface_create(bmi_interface_t **bmi, const char *device) {
 #endif
 
   if (pcap_activate(bmi_->pcap) != 0) {
+    printf("Cannot activate pcap interface: %s!\n", device);
     pcap_close(bmi_->pcap);
     free(bmi_);
     return -1;
@@ -196,6 +215,7 @@ int bmi_interface_create(bmi_interface_t **bmi, const char *device) {
 
   bmi_->fd = pcap_get_selectable_fd(bmi_->pcap);
   if(bmi_->fd < 0) {
+    printf("Cannot get the selectable fd of pcap interface: %s!\n", device);
     pcap_close(bmi_->pcap);
     free(bmi_);
     return -1;
@@ -203,15 +223,21 @@ int bmi_interface_create(bmi_interface_t **bmi, const char *device) {
 
   /* Configure the control port */
   char* ptr = device;
-  while (*ptr != '-') ptr++; // skip host name
-  ptr += 3; // skip prefix "eth"
-  bmi_->control_port_index = atoi(ptr);
+  while (*ptr != '-' && *ptr != 0) ptr++; // skip host name
+  if (*ptr == 0) {
+    bmi_->control_port_index = (random() % 100) + 100;
+  }
+  else {
+    ptr += 4; // skip prefix "eth"
+    if (isalpha(*ptr)) bmi_->control_port_index = (random() % 100) + 100;
+    else bmi_->control_port_index = atoi(ptr);
+  }
 
   /* Set up the thread that run the control socket */
   pthread_t pt_id;
   if (pthread_create(&pt_id, NULL, &bmi_interface_control_thread, (void *)bmi_) != 0) {
     pcap_close(bmi_->pcap);
-    printf("Cannot set up control thread!\n");
+    printf("Cannot set up control thread for pcap interface: %s!\n", device);
     free(bmi_);
     return -1;
   }
@@ -283,6 +309,7 @@ int bmi_interface_recv(bmi_interface_t *bmi, const char **data) {
     uint16_t ether_type = 0;
     strncpy((char *)&ether_type, pkt_data + (ETH_ALEN * 2), 2);
     ether_type = ntohs(ether_type);
+    printf("ether_type: %x\n", ether_type);
     if (ether_type == ETH_P_IP) {
       // ipv4 packet
       const unsigned char *ipv4_hdr = pkt_data + (ETH_ALEN * 2) + 2;
@@ -290,8 +317,11 @@ int bmi_interface_recv(bmi_interface_t *bmi, const char **data) {
       for (int i = 0; i < IPV4_4B_NUM; ++i) {
         // check each 4 bytes word in the ipv4 header
         uint32_t word = 0;
-        strncpy((char *)&word, ipv4_hdr + i * 32, 32);
+        strncpy((char *)&word, ipv4_hdr + i * 4, 4);
+        printf("word-%d: %x\n", i, word);
         word = ntohl(word) & bmi->drop_rule.ipv4_masks[i];
+        printf("header-%d: %x\n", i, word);
+        printf("rule-%d: %x\n", i, bmi->drop_rule.ipv4_vals[i]);
         if (word != bmi->drop_rule.ipv4_vals[i]) {
           // mismatch, disable the drop flag
           drop_flag = 0;
