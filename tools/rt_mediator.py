@@ -4,6 +4,7 @@ from runtime_CLI import RuntimeAPI
 from runtime_CLI import get_parser, thrift_connect, load_json_config
 
 class MonitorThread(threading.Thread):
+    "The thread monitors netlink messages and update the forwarding table of the bmv2 switch accordingly"
     def __init__(self, runtime):
         threading.Thread.__init__(self)
         assert (type(runtime) == RuntimeAPI)
@@ -26,7 +27,6 @@ class MonitorThread(threading.Thread):
                 dstMaskLen = str(message['dst_len'])
                 next_hop = str()
                 egress_port = str()
-                priority = 1
 
                 # parse attrs
                 attrs = message['attrs']
@@ -42,7 +42,7 @@ class MonitorThread(threading.Thread):
                         device_name = str(device_name).split('-')
                         port_name = device_name[1] if len(device_name) > 1 else device_name[0]
                         egress_port = int(port_name[3:])
-                entry = 'Ipv4_FIB' + ' ' + action + ' ' + srcAddr + '&&&' + srcMask + ' ' + dstAddr + '/' + dstMaskLen + " => " + next_hop + ' ' + str(egress_port) + ' ' + str(priority)
+                entry = 'Ipv4_FIB' + ' ' + action + ' ' + srcAddr + '&&&' + srcMask + ' ' + dstAddr + '/' + dstMaskLen + " => " + next_hop + ' ' + str(egress_port)
                 print("Add an entry: " + entry)
                 handle = self.runtime.do_table_add(entry)
                 handleDict[dstAddr + '/' + dstMaskLen] = handle
