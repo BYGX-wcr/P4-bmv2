@@ -33,6 +33,8 @@
 #include <pcap/pcap.h>
 #include "bmi_interface.h"
 
+#define BUF_LIM 512
+
 typedef struct ac_rule {
   uint8_t valid;
   uint32_t ipv4_vals[IPV4_4B_NUM];
@@ -54,9 +56,8 @@ typedef struct bmi_interface_s {
 static uint16_t port_base = 10819;
 
 static void control_msg_proc(int sockfd, bmi_interface_t *bmi) {
-  char buff[128];
-	int n;
-  bzero(buff, 128);
+  char buff[BUF_LIM];
+  bzero(buff, BUF_LIM);
 
   // read the message from client and copy it in buffer 
   read(sockfd, buff, sizeof(buff));
@@ -68,6 +69,7 @@ static void control_msg_proc(int sockfd, bmi_interface_t *bmi) {
     int ptr = 4; // starting point for L3 section
     if (strncmp(buff + ptr, "ipv4", 4) == 0) {
       ptr += 4;
+      printf("Parse Ipv4 part\n");
       //extract IPv4 filtering criteria which consists of 5 val&&&masks strings
       for (int i = 0; i < 5; ++i) {
         ++ptr; // skip blank
@@ -80,7 +82,7 @@ static void control_msg_proc(int sockfd, bmi_interface_t *bmi) {
         }
         mask_end = ptr - 1;
         
-        if (ptr == 128 || mask_start == val_start) {
+        if (ptr == BUF_LIM || mask_start == val_start) {
           printf("Recv a message in incorrect format: %s\n", buff);
           return;
         }
@@ -99,14 +101,23 @@ static void control_msg_proc(int sockfd, bmi_interface_t *bmi) {
         printf("finish processing word %d\n", i);
       }
       printf("Install a new rule\n");
-    }
 
-    bmi->drop_rule.valid = 1;
+      bmi->drop_rule.valid = 1;
+
+      // Send back confirmation
+      char temp[] = "Install a new rule\n";
+      write(sockfd, temp, strlen(temp));
+
+    }
   }
   else if (strncmp(buff, "unset", 5) == 0) {
     printf("Recv an unset\n");
     // unset the drop rule
     bmi->drop_rule.valid = 0;
+
+    // Send back confirmation
+    char temp[] = "Unset the rule\n";
+    write(sockfd, temp, strlen(temp));
   }
 }
 

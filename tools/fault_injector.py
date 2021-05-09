@@ -13,3 +13,6 @@ if __name__ == "__main__":
         cmdStr = input("Type in command: ")
         sk.sendall(str.encode(cmdStr, encoding="utf-8"))
 
+        feedback = sk.recv(512)
+        print("Feedback: ", feedback.decode())
+
