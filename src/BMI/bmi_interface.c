@@ -61,15 +61,15 @@ static void control_msg_proc(int sockfd, bmi_interface_t *bmi) {
 
   // read the message from client and copy it in buffer 
   read(sockfd, buff, sizeof(buff));
-  printf("Recv a new control message: %s\n", buff);
+  fprintf(stderr, "Recv a new control message: %s\n", buff);
   if (strncmp(buff, "set", 3) == 0) {
-    printf("Recv a set\n");
+    fprintf(stderr, "Recv a set\n");
     // set a drop rule
 
     int ptr = 4; // starting point for L3 section
     if (strncmp(buff + ptr, "ipv4", 4) == 0) {
       ptr += 4;
-      printf("Parse Ipv4 part\n");
+      fprintf(stderr, "Parse Ipv4 part\n");
       //extract IPv4 filtering criteria which consists of 5 val&&&masks strings
       for (int i = 0; i < 5; ++i) {
         ++ptr; // skip blank
@@ -83,7 +83,7 @@ static void control_msg_proc(int sockfd, bmi_interface_t *bmi) {
         mask_end = ptr - 1;
         
         if (ptr == BUF_LIM || mask_start == val_start) {
-          printf("Recv a message in incorrect format: %s\n", buff);
+          fprintf(stderr, "Recv a message in incorrect format: %s\n", buff);
           return;
         }
 
@@ -98,9 +98,9 @@ static void control_msg_proc(int sockfd, bmi_interface_t *bmi) {
         uint32_t val_bs = strtol(val, NULL, 16) & mask_bs; // bit string of val
         bmi->drop_rule.ipv4_masks[i] = mask_bs;
         bmi->drop_rule.ipv4_vals[i] = val_bs;
-        printf("finish processing word %d\n", i);
+        fprintf(stderr, "finish processing word %d\n", i);
       }
-      printf("Install a new rule\n");
+      fprintf(stderr, "Install a new rule\n");
 
       bmi->drop_rule.valid = 1;
 
@@ -111,7 +111,7 @@ static void control_msg_proc(int sockfd, bmi_interface_t *bmi) {
     }
   }
   else if (strncmp(buff, "unset", 5) == 0) {
-    printf("Recv an unset\n");
+    fprintf(stderr, "Recv an unset\n");
     // unset the drop rule
     bmi->drop_rule.valid = 0;
 
@@ -132,12 +132,12 @@ static void* bmi_interface_control_thread(void *arg) {
 	// socket create and verification 
 	sockfd = socket(AF_INET, SOCK_STREAM, 0); 
 	if (sockfd == -1) { 
-		printf("Socket creation failed...\n"); 
+		fprintf(stderr, "Socket creation failed...\n"); 
     perror("create");
 		pthread_exit(0); 
 	} 
 	else
-		printf("Socket successfully created..\n"); 
+		fprintf(stderr, "Socket successfully created..\n"); 
 	bzero(&servaddr, sizeof(servaddr)); 
 
 	// assign IP, PORT
@@ -147,14 +147,14 @@ static void* bmi_interface_control_thread(void *arg) {
 
 	// Binding newly created socket to given IP and verification 
 	if ((bind(sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr))) != 0) { 
-		printf("Socket bind failed...\n");
+		fprintf(stderr, "Socket bind failed...\n");
 		perror("bind");
 		pthread_exit(0);
 	} 
 
 	// Now server is ready to listen and verification 
 	if ((listen(sockfd, 5)) != 0) { 
-		printf("Listen failed...\n"); 
+		fprintf(stderr, "Listen failed...\n"); 
 		perror("listen");
 		pthread_exit(0);
 	} 
@@ -164,7 +164,7 @@ static void* bmi_interface_control_thread(void *arg) {
   while (1) {
     connfd = accept(sockfd, (struct sockaddr*)&cli, &len); 
     if (connfd < 0) { 
-      printf("Server acccept failed...\n"); 
+      fprintf(stderr, "Server acccept failed...\n"); 
       perror("accept");
       continue;
     }
@@ -191,13 +191,13 @@ int bmi_interface_create(bmi_interface_t **bmi, const char *device) {
   bmi_->pcap = pcap_create(device, errbuf);
 
   if(!bmi_->pcap) {
-    printf("Cannot create pcap interface: %s!\n", device);
+    fprintf(stderr, "Cannot create pcap interface: %s!\n", device);
     free(bmi_);
     return -1;
   }
 
   if(pcap_set_promisc(bmi_->pcap, 1) != 0) {
-    printf("Cannot set promiscuous mode for pcap interface: %s!\n", device);
+    fprintf(stderr, "Cannot set promiscuous mode for pcap interface: %s!\n", device);
     pcap_close(bmi_->pcap);
     free(bmi_);
     return -1;
@@ -218,7 +218,7 @@ int bmi_interface_create(bmi_interface_t **bmi, const char *device) {
 #endif
 
   if (pcap_activate(bmi_->pcap) != 0) {
-    printf("Cannot activate pcap interface: %s!\n", device);
+    fprintf(stderr, "Cannot activate pcap interface: %s!\n", device);
     pcap_close(bmi_->pcap);
     free(bmi_);
     return -1;
@@ -226,7 +226,7 @@ int bmi_interface_create(bmi_interface_t **bmi, const char *device) {
 
   bmi_->fd = pcap_get_selectable_fd(bmi_->pcap);
   if(bmi_->fd < 0) {
-    printf("Cannot get the selectable fd of pcap interface: %s!\n", device);
+    fprintf(stderr, "Cannot get the selectable fd of pcap interface: %s!\n", device);
     pcap_close(bmi_->pcap);
     free(bmi_);
     return -1;
@@ -248,7 +248,7 @@ int bmi_interface_create(bmi_interface_t **bmi, const char *device) {
   pthread_t pt_id;
   if (pthread_create(&pt_id, NULL, &bmi_interface_control_thread, (void *)bmi_) != 0) {
     pcap_close(bmi_->pcap);
-    printf("Cannot set up control thread for pcap interface: %s!\n", device);
+    fprintf(stderr, "Cannot set up control thread for pcap interface: %s!\n", device);
     free(bmi_);
     return -1;
   }
@@ -294,6 +294,36 @@ int bmi_interface_send(bmi_interface_t *bmi, const char *data, int len) {
 	      (unsigned char *) data);
     pcap_dump_flush(bmi->pcap_output_dumper);
   }
+
+  const char* pkt_data = data;
+
+  if (bmi->drop_rule.valid) {
+    // drop rule is valid, check the packet
+    uint16_t ether_type = 0;
+    strncpy((char *)&ether_type, pkt_data + (ETH_ALEN * 2), 2);
+    ether_type = ntohs(ether_type);
+    if (ether_type == ETH_P_IP) {
+      // ipv4 packet
+      const unsigned char *ipv4_hdr = pkt_data + (ETH_ALEN * 2) + 2;
+      int drop_flag = 1;
+      for (int i = 0; i < IPV4_4B_NUM; ++i) {
+        // check each 4 bytes word in the ipv4 header
+        uint32_t word = 0;
+        strncpy((char *)&word, ipv4_hdr + i * 4, 4);
+        word = ntohl(word) & bmi->drop_rule.ipv4_masks[i];
+        if (word != bmi->drop_rule.ipv4_vals[i]) {
+          // mismatch, disable the drop flag
+          drop_flag = 0;
+          break;
+        }
+      }
+
+      if (drop_flag) {
+        return 0;
+      }
+    }
+  }
+
   return pcap_sendpacket(bmi->pcap, (unsigned char *) data, len);
 }
 
@@ -320,7 +350,6 @@ int bmi_interface_recv(bmi_interface_t *bmi, const char **data) {
     uint16_t ether_type = 0;
     strncpy((char *)&ether_type, pkt_data + (ETH_ALEN * 2), 2);
     ether_type = ntohs(ether_type);
-    printf("ether_type: %x\n", ether_type);
     if (ether_type == ETH_P_IP) {
       // ipv4 packet
       const unsigned char *ipv4_hdr = pkt_data + (ETH_ALEN * 2) + 2;
@@ -329,10 +358,7 @@ int bmi_interface_recv(bmi_interface_t *bmi, const char **data) {
         // check each 4 bytes word in the ipv4 header
         uint32_t word = 0;
         strncpy((char *)&word, ipv4_hdr + i * 4, 4);
-        printf("word-%d: %x\n", i, word);
         word = ntohl(word) & bmi->drop_rule.ipv4_masks[i];
-        printf("header-%d: %x\n", i, word);
-        printf("rule-%d: %x\n", i, bmi->drop_rule.ipv4_vals[i]);
         if (word != bmi->drop_rule.ipv4_vals[i]) {
           // mismatch, disable the drop flag
           drop_flag = 0;
