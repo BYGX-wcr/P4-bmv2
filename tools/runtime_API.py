@@ -2043,6 +2043,8 @@ class RuntimeAPI(cmd.Cmd):
         print("%s[%d]= (%d bytes, %d packets)" %
               (counter_name, index, value.bytes, value.packets))
 
+        return value.bytes, value.packets
+
     def complete_counter_read(self, text, line, start_index, end_index):
         return self._complete_counters(text)
 
