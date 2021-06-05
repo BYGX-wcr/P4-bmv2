@@ -25,6 +25,8 @@
 #include <assert.h>
 #include <ctype.h>
 #include <unistd.h>
+#include <signal.h>
+#include <errno.h>
 #include <linux/socket.h> 
 #include <linux/types.h>
 #include <linux/if_ether.h>
@@ -32,8 +34,13 @@
 
 #include <pcap/pcap.h>
 #include "bmi_interface.h"
+#include "delay_buffer.h"
 
 #define BUF_LIM 512
+#define SIG_MYTIMER_BASE SIGRTMIN
+#define PORT_BASE 10819
+
+static int timer_signo_ptr = 0;
 
 typedef struct ac_rule {
   uint8_t valid;
@@ -49,11 +56,166 @@ typedef struct bmi_interface_s {
   pcap_dumper_t *pcap_output_dumper;
 
   /* New members added by WCR, UCLA CSD */
-  ac_rule_t drop_rule;
-  uint16_t control_port_index;
+  char device_name[100]; // The name of the interface
+  uint16_t control_port_index; // The index of the tcp port running control thread
+
+  ac_rule_t drop_rule; // ACL for fault injection -> drop
+
+  ac_rule_t delay_rule; // ACL for fault injection -> delay
+  int egress_signo; // Signal number for fault injection -> delay in egress direction
+  time_t egress_timerid; // Timer for fault injection -> delay in egress direction
+  delay_buffer_t egress_delay_buffer; // Buffer for fault injection -> delay in egress direction
+  int ingress_signo; // Signal number for fault injection -> delay in ingress direction
+  time_t ingress_timerid; // Timer for fault injection -> delay in ingress direction
+  delay_buffer_t ingress_delay_buffer; // Buffer for fault injection -> delay in ingress direction
 } bmi_interface_t;
 
-static uint16_t port_base = 10819;
+void block_timer_signal(int signo) {
+  /* Block timer signal temporarily. */
+  sigset_t mask;
+  sigemptyset(&mask);
+  sigaddset(&mask, signo);
+  sigprocmask(SIG_SETMASK, &mask, NULL);
+}
+
+void unblock_timer_signal(int signo) {
+  /* Unblock the timer signal. */
+  sigset_t mask;
+  sigemptyset(&mask);
+  sigaddset(&mask, signo);
+  sigprocmask(SIG_UNBLOCK, &mask, NULL);
+}
+
+static void add_egress_delay_packet(bmi_interface_t *bmi, const char *data, int len, time_t delay) {
+  block_timer_signal(SIG_MYTIMER_BASE + bmi->egress_signo);
+
+  // get real time system clock
+  struct timespec now;
+  clock_gettime(CLOCK_REALTIME, &now);
+
+  // construct the record of the packet
+  struct timespec future;
+  future.tv_nsec = now.tv_nsec + delay * 1e6;
+  future.tv_sec = now.tv_sec;
+  if (future.tv_nsec > 1e9) {
+    future.tv_sec++;
+    future.tv_nsec -= 1e9;
+  }
+  delay_pkt_t* pkt = malloc(sizeof(delay_pkt_t));
+  pkt->data = malloc(len);
+  pkt->len = len;
+  pkt->ts = future;
+
+  // insert into the delay buffer
+  insert_pkt(&bmi->egress_delay_buffer, pkt);
+
+  // check whether there is any expired packet
+  struct timespec head_ts;
+  while (1) {
+    head_ts = get_head_ts(&bmi->egress_delay_buffer);
+    clock_gettime(CLOCK_REALTIME, &now);
+    if ((head_ts.tv_nsec != 0 && head_ts.tv_sec != 0) && time_cmp(now, head_ts) >= 0) {
+      // the packet at the head has been expired
+      delay_pkt_t* head_pkt = get_head(&bmi->egress_delay_buffer);
+
+      pcap_sendpacket(bmi->pcap, (unsigned char *)head_pkt->data, head_pkt->len);
+      delete_head_pkt(&bmi->egress_delay_buffer);
+    }
+    else
+      break;
+  }
+
+  // update timer
+  head_ts = get_head_ts(&bmi->egress_delay_buffer);
+  struct itimerspec its;
+  its.it_value = head_ts;
+  its.it_interval.tv_sec = 0;
+  its.it_interval.tv_nsec = 0;
+  if (timer_settime(bmi->egress_timerid, 0, &its, NULL) == -1)
+    errExit("timer_settime");
+
+  unblock_timer_signal(SIG_MYTIMER_BASE + bmi->egress_signo);
+}
+
+static void egress_delay_packet_handler(int sig, siginfo_t *si, void *uc) {
+  timer_t timerid = si->_sifields._rt.si_sigval.sival_int;
+  bmi_interface_t *bmi = si->_sifields._rt.si_sigval.sival_ptr;
+  // send & remove the packet at the head of buffer
+  delay_pkt_t* head_pkt = get_head(&bmi->egress_delay_buffer);
+
+  pcap_sendpacket(bmi->pcap, (unsigned char *)head_pkt->data, head_pkt->len);
+  delete_head_pkt(&bmi->egress_delay_buffer);
+
+  // update timer
+  struct timespec head_ts = get_head_ts(&bmi->egress_delay_buffer);
+  struct itimerspec its;
+  its.it_value = head_ts;
+  its.it_interval.tv_sec = 0;
+  its.it_interval.tv_nsec = 0;
+  if (timer_settime(bmi->egress_timerid, 0, &its, NULL) == -1)
+    errExit("timer_settime");
+}
+
+static void ingress_delay_packet_handler(int sig, siginfo_t *si, void *uc) {
+  // just need to break the polling loop of pcap_next
+  bmi_interface_t *bmi = si->_sifields._rt.si_sigval.sival_ptr;
+  pcap_breakloop(bmi->pcap);
+}
+
+static void delay_packet_timer_init(bmi_interface_t *bmi) {
+  timer_t egress_timerid;
+  struct sigevent egress_sev;
+  struct sigaction egress_sa;
+  timer_t ingress_timerid;
+  struct sigevent ingress_sev;
+  struct sigaction ingress_sa;
+  int egress_signo = SIG_MYTIMER_BASE + (timer_signo_ptr++);
+  int ingress_signo = SIG_MYTIMER_BASE + (timer_signo_ptr++);
+
+  /* Establish handler for timer signal. */
+
+  fprintf(stderr, "Initialize the timers for the interface %s\n", bmi->device_name);
+  egress_sa.sa_flags = SA_SIGINFO;
+  egress_sa.sa_sigaction = egress_delay_packet_handler;
+  ingress_sa.sa_flags = SA_SIGINFO;
+  ingress_sa.sa_sigaction = ingress_delay_packet_handler;
+  sigemptyset(&egress_sa.sa_mask);
+  sigemptyset(&ingress_sa.sa_mask);
+  sigaction(egress_signo, &egress_sa, NULL);
+  sigaction(ingress_signo, &ingress_sa, NULL);
+
+  /* Create the egress timer */
+
+  egress_sev.sigev_notify = SIGEV_SIGNAL;
+  egress_sev.sigev_signo = egress_signo;
+  egress_sev.sigev_value.sival_int = (int)egress_timerid;
+  egress_sev.sigev_value.sival_ptr = (void *)bmi;
+  timer_create(CLOCK_REALTIME, &egress_sev, &egress_timerid);
+  fprintf(stderr, "Egress timer for interface %s: %#jx\n", bmi->device_name, (uintmax_t) egress_timerid);
+
+  /* Create the ingress timer */
+
+  ingress_sev.sigev_notify = SIGEV_SIGNAL;
+  ingress_sev.sigev_signo = ingress_signo;
+  ingress_sev.sigev_value.sival_int = (int)ingress_timerid;
+  ingress_sev.sigev_value.sival_ptr = (void *)bmi;
+  timer_create(CLOCK_REALTIME, &ingress_sev, &ingress_timerid);
+  fprintf(stderr, "Ingress timer for interface %s: %#jx\n", bmi->device_name, (uintmax_t) ingress_timerid);
+
+  /* Init data structures for both ingress timer and egress timer */
+
+  bmi->egress_timerid = egress_timerid;
+  bmi->egress_signo = egress_signo;
+  bmi->egress_delay_buffer.head = malloc(sizeof(delay_pkt_t));
+  memset(bmi->egress_delay_buffer.head, 0, sizeof(delay_pkt_t));
+  bmi->egress_delay_buffer.size = 0;
+
+  bmi->ingress_timerid = ingress_timerid;
+  bmi->ingress_signo = ingress_signo;
+  bmi->ingress_delay_buffer.head = malloc(sizeof(delay_pkt_t));
+  memset(bmi->ingress_delay_buffer.head, 0, sizeof(delay_pkt_t));
+  bmi->ingress_delay_buffer.size = 0;
+}
 
 static void control_msg_proc(int sockfd, bmi_interface_t *bmi) {
   char buff[BUF_LIM];
@@ -143,7 +305,7 @@ static void* bmi_interface_control_thread(void *arg) {
 	// assign IP, PORT
 	servaddr.sin_family = AF_INET;
 	servaddr.sin_addr.s_addr = htonl(INADDR_ANY); 
-	servaddr.sin_port = htons(port_base + bmi->control_port_index);
+	servaddr.sin_port = htons(PORT_BASE + bmi->control_port_index);
 
 	// Binding newly created socket to given IP and verification 
 	if ((bind(sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr))) != 0) { 
@@ -233,6 +395,7 @@ int bmi_interface_create(bmi_interface_t **bmi, const char *device) {
   }
 
   /* Configure the control port */
+  strncpy(bmi_->device_name, device, 100);
   char* ptr = device;
   while (*ptr != '-' && *ptr != 0) ptr++; // skip host name
   if (*ptr == 0) {
@@ -252,6 +415,9 @@ int bmi_interface_create(bmi_interface_t **bmi, const char *device) {
     free(bmi_);
     return -1;
   }
+
+  /* Initialize the timer used to control delayed packets */
+  delay_packet_timer_init(bmi_);
 
   *bmi = bmi_;
   return 0;
@@ -324,6 +490,8 @@ int bmi_interface_send(bmi_interface_t *bmi, const char *data, int len) {
     }
   }
 
+  /* If the packet has been dropped, the control flow will not reach here */
+
   return pcap_sendpacket(bmi->pcap, (unsigned char *) data, len);
 }
 
@@ -332,7 +500,13 @@ int bmi_interface_recv(bmi_interface_t *bmi, const char **data) {
   struct pcap_pkthdr *pkt_header;
   const unsigned char *pkt_data;
 
-  if(pcap_next_ex(bmi->pcap, &pkt_header, &pkt_data) != 1) {
+  //TODO: check whether there is any delay packet expired
+
+  int retcode = pcap_next_ex(bmi->pcap, &pkt_header, &pkt_data);
+  if(retcode == -2) {
+    //TODO: the ingress timer expired, handle that packet
+  }
+  else {
     return -1;
   }
 
@@ -367,7 +541,7 @@ int bmi_interface_recv(bmi_interface_t *bmi, const char **data) {
       }
 
       if (drop_flag) {
-        return 0;
+        return -1;
       }
     }
   }
