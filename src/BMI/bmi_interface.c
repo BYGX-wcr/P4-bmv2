@@ -62,13 +62,80 @@ typedef struct bmi_interface_s {
   ac_rule_t drop_rule; // ACL for fault injection -> drop
 
   ac_rule_t delay_rule; // ACL for fault injection -> delay
+  int delay_flags; // Falgs for fault injection -> delay, 0-egress, 1-ingress
+  time_t delay_interval; // The delay interval for fault injection -> delay
   int egress_signo; // Signal number for fault injection -> delay in egress direction
-  time_t egress_timerid; // Timer for fault injection -> delay in egress direction
+  timer_t egress_timerid; // Timer for fault injection -> delay in egress direction
   delay_buffer_t egress_delay_buffer; // Buffer for fault injection -> delay in egress direction
   int ingress_signo; // Signal number for fault injection -> delay in ingress direction
-  time_t ingress_timerid; // Timer for fault injection -> delay in ingress direction
+  timer_t ingress_timerid; // Timer for fault injection -> delay in ingress direction
   delay_buffer_t ingress_delay_buffer; // Buffer for fault injection -> delay in ingress direction
 } bmi_interface_t;
+
+static void parser_rule(ac_rule_t *rule, char *buff) {
+  // parse the rule 
+  int ptr = 0
+  if (strncmp(buff + ptr, "ipv4", 4) == 0) {
+    ptr += 4;
+    fprintf(stderr, "Parse Ipv4 part\n");
+    //extract IPv4 filtering criteria which consists of 5 val&&&masks strings
+    for (int i = 0; i < 5; ++i) {
+      ++ptr; // skip blank
+      int val_start = ptr, mask_start = ptr;
+      int val_end = 0, mask_end = 0;
+      while (buff[ptr] != ' ' && ptr < strlen(buff)) {
+        if (buff[ptr - 1] == '&' && buff[ptr] != '&') mask_start = ptr;
+        if (buff[ptr + 1] == '&' && buff[ptr] != '&') val_end = ptr;
+        ++ptr;
+      }
+      mask_end = ptr - 1;
+      
+      if (ptr == BUF_LIM || mask_start == val_start) {
+        fprintf(stderr, "Recv a message in incorrect format: %s\n", buff);
+        return;
+      }
+
+      char val[20];
+      char mask[20];
+      bzero(val, 20);
+      bzero(mask, 20);
+
+      strncpy(val, buff + val_start, (val_end - val_start) + 1);
+      strncpy(mask, buff + mask_start, (mask_end - mask_start) + 1);
+      uint32_t mask_bs = strtol(mask, NULL, 16); // bit string of mask
+      uint32_t val_bs = strtol(val, NULL, 16) & mask_bs; // bit string of val
+      rule->ipv4_masks[i] = mask_bs;
+      rule->ipv4_vals[i] = val_bs;
+      fprintf(stderr, "finish processing word %d\n", i);
+    }
+    fprintf(stderr, "Install a new rule\n");
+
+    rule->valid = 1;
+  }
+}
+
+static int match_rule(ac_rule_t *rule, const char* pkt_data, int len) {
+  /* check whether the rule matches the packet, yes -> return non-zerovalue, no -> return zero */
+  uint16_t ether_type = 0;
+  strncpy((char *)&ether_type, pkt_data + (ETH_ALEN * 2), 2);
+  ether_type = ntohs(ether_type);
+  if (ether_type == ETH_P_IP) {
+    // ipv4 packet
+    const unsigned char *ipv4_hdr = pkt_data + (ETH_ALEN * 2) + 2;
+    for (int i = 0; i < IPV4_4B_NUM; ++i) {
+      // check each 4 bytes word in the ipv4 header
+      uint32_t word = 0;
+      strncpy((char *)&word, ipv4_hdr + i * 4, 4);
+      word = ntohl(word) & rule->ipv4_masks[i];
+      if (word != rule->ipv4_vals[i]) {
+        // mismatch, disable the drop flag
+        return 0;
+      }
+    }
+  }
+
+  return 1;
+}
 
 void block_timer_signal(int signo) {
   /* Block timer signal temporarily. */
@@ -86,7 +153,19 @@ void unblock_timer_signal(int signo) {
   sigprocmask(SIG_UNBLOCK, &mask, NULL);
 }
 
-static void add_egress_delay_packet(bmi_interface_t *bmi, const char *data, int len, time_t delay) {
+static void update_timer(delay_buffer_t *buf, timer_t timerid) {
+  // update the timer
+  head_ts = get_head_ts(buf);
+  struct itimerspec its;
+  its.it_value = head_ts;
+  its.it_interval.tv_sec = 0;
+  its.it_interval.tv_nsec = 0;
+  if (timer_settime(timerid, 0, &its, NULL) == -1)
+    fprintf(stderr, "Timer set failed!\n");
+}
+
+static void add_egress_delay_packet(bmi_interface_t *bmi, const char *data, int len, time_t delay_interval) {
+  /* Add a packet into egress delay system; the delay interval is caculated as microseconds */
   block_timer_signal(SIG_MYTIMER_BASE + bmi->egress_signo);
 
   // get real time system clock
@@ -95,7 +174,7 @@ static void add_egress_delay_packet(bmi_interface_t *bmi, const char *data, int 
 
   // construct the record of the packet
   struct timespec future;
-  future.tv_nsec = now.tv_nsec + delay * 1e6;
+  future.tv_nsec = now.tv_nsec + delay_interval * 1e6;
   future.tv_sec = now.tv_sec;
   if (future.tv_nsec > 1e9) {
     future.tv_sec++;
@@ -126,13 +205,7 @@ static void add_egress_delay_packet(bmi_interface_t *bmi, const char *data, int 
   }
 
   // update timer
-  head_ts = get_head_ts(&bmi->egress_delay_buffer);
-  struct itimerspec its;
-  its.it_value = head_ts;
-  its.it_interval.tv_sec = 0;
-  its.it_interval.tv_nsec = 0;
-  if (timer_settime(bmi->egress_timerid, 0, &its, NULL) == -1)
-    errExit("timer_settime");
+  update_timer(&bmi->egress_delay_buffer, bmi->egress_timerid);
 
   unblock_timer_signal(SIG_MYTIMER_BASE + bmi->egress_signo);
 }
@@ -147,13 +220,37 @@ static void egress_delay_packet_handler(int sig, siginfo_t *si, void *uc) {
   delete_head_pkt(&bmi->egress_delay_buffer);
 
   // update timer
-  struct timespec head_ts = get_head_ts(&bmi->egress_delay_buffer);
-  struct itimerspec its;
-  its.it_value = head_ts;
-  its.it_interval.tv_sec = 0;
-  its.it_interval.tv_nsec = 0;
-  if (timer_settime(bmi->egress_timerid, 0, &its, NULL) == -1)
-    errExit("timer_settime");
+  update_timer(&bmi->egress_delay_buffer, bmi->egress_timerid);
+}
+
+static void add_ingress_delay_packet(bmi_interface_t *bmi, const char *data, int len, time_t delay_interval) {
+  /* Add a packet into egress delay system; the delay interval is caculated as microseconds */
+  block_timer_signal(SIG_MYTIMER_BASE + bmi->ingress_signo);
+
+  // get real time system clock
+  struct timespec now;
+  clock_gettime(CLOCK_REALTIME, &now);
+
+  // construct the record of the packet
+  struct timespec future;
+  future.tv_nsec = now.tv_nsec + delay_interval * 1e6;
+  future.tv_sec = now.tv_sec;
+  if (future.tv_nsec > 1e9) {
+    future.tv_sec++;
+    future.tv_nsec -= 1e9;
+  }
+  delay_pkt_t* pkt = malloc(sizeof(delay_pkt_t));
+  pkt->data = malloc(len);
+  pkt->len = len;
+  pkt->ts = future;
+
+  // insert into the delay buffer
+  insert_pkt(&bmi->ingress_delay_buffer, pkt);
+
+  // update timer
+  update_timer(&bmi->ingress_delay_buffer, bmi->ingress_timerid);
+
+  unblock_timer_signal(SIG_MYTIMER_BASE + bmi->ingress_signo);
 }
 
 static void ingress_delay_packet_handler(int sig, siginfo_t *si, void *uc) {
@@ -224,62 +321,46 @@ static void control_msg_proc(int sockfd, bmi_interface_t *bmi) {
   // read the message from client and copy it in buffer 
   read(sockfd, buff, sizeof(buff));
   fprintf(stderr, "Recv a new control message: %s\n", buff);
-  if (strncmp(buff, "set", 3) == 0) {
-    fprintf(stderr, "Recv a set\n");
-    // set a drop rule
+  if (strncmp(buff, "drop", 4) == 0) {
+    fprintf(stderr, "Recv a drop\n");
 
     int ptr = 4; // starting point for L3 section
-    if (strncmp(buff + ptr, "ipv4", 4) == 0) {
-      ptr += 4;
-      fprintf(stderr, "Parse Ipv4 part\n");
-      //extract IPv4 filtering criteria which consists of 5 val&&&masks strings
-      for (int i = 0; i < 5; ++i) {
-        ++ptr; // skip blank
-        int val_start = ptr, mask_start = ptr;
-        int val_end = 0, mask_end = 0;
-        while (buff[ptr] != ' ' && ptr < strlen(buff)) {
-          if (buff[ptr - 1] == '&' && buff[ptr] != '&') mask_start = ptr;
-          if (buff[ptr + 1] == '&' && buff[ptr] != '&') val_end = ptr;
-          ++ptr;
-        }
-        mask_end = ptr - 1;
-        
-        if (ptr == BUF_LIM || mask_start == val_start) {
-          fprintf(stderr, "Recv a message in incorrect format: %s\n", buff);
-          return;
-        }
+    parser_rule(&bmi->drop_rule, buff + ptr);
 
-        char val[20];
-        char mask[20];
-        bzero(val, 20);
-        bzero(mask, 20);
-
-        strncpy(val, buff + val_start, (val_end - val_start) + 1);
-        strncpy(mask, buff + mask_start, (mask_end - mask_start) + 1);
-        uint32_t mask_bs = strtol(mask, NULL, 16); // bit string of mask
-        uint32_t val_bs = strtol(val, NULL, 16) & mask_bs; // bit string of val
-        bmi->drop_rule.ipv4_masks[i] = mask_bs;
-        bmi->drop_rule.ipv4_vals[i] = val_bs;
-        fprintf(stderr, "finish processing word %d\n", i);
-      }
-      fprintf(stderr, "Install a new rule\n");
-
-      bmi->drop_rule.valid = 1;
-
-      // Send back confirmation
-      char temp[] = "Install a new rule\n";
-      write(sockfd, temp, strlen(temp));
-
-    }
+    // Send back confirmation
+    char temp[] = "Install a new drop rule\n";
+    write(sockfd, temp, strlen(temp));
   }
-  else if (strncmp(buff, "unset", 5) == 0) {
-    fprintf(stderr, "Recv an unset\n");
-    // unset the drop rule
+  else if (strncmp(buff, "undrop", 6) == 0) {
+    fprintf(stderr, "Recv an undrop\n");
     bmi->drop_rule.valid = 0;
 
     // Send back confirmation
-    char temp[] = "Unset the rule\n";
+    char temp[] = "Unset the drop rule\n";
     write(sockfd, temp, strlen(temp));
+  }
+  else if (strncmp(buff, "delay", 5) == 0) {
+    fprintf(stderr, "Recv a delay\n");
+
+    // TODO: process delay interval & delay flags
+
+    int ptr = 5; // starting point for L3 section
+    parser_rule(&bmi->delay_rule, buff + ptr);
+
+    // Send back confirmation
+    char temp[] = "Install a new delay rule\n";
+    write(sockfd, temp, strlen(temp));
+  }
+  else if (strncmp(buff, "undelay", 7) == 0) {
+    fprintf(stderr, "Recv an undelay\n");
+    bmi->delay_rule.valid = 0;
+
+    // Send back confirmation
+    char temp[] = "Unset the delay rule\n";
+    write(sockfd, temp, strlen(temp));
+  }
+  else {
+    fprintf(stderr, "Recv an unsupported operation\n");
   }
 }
 
@@ -465,28 +546,15 @@ int bmi_interface_send(bmi_interface_t *bmi, const char *data, int len) {
 
   if (bmi->drop_rule.valid) {
     // drop rule is valid, check the packet
-    uint16_t ether_type = 0;
-    strncpy((char *)&ether_type, pkt_data + (ETH_ALEN * 2), 2);
-    ether_type = ntohs(ether_type);
-    if (ether_type == ETH_P_IP) {
-      // ipv4 packet
-      const unsigned char *ipv4_hdr = pkt_data + (ETH_ALEN * 2) + 2;
-      int drop_flag = 1;
-      for (int i = 0; i < IPV4_4B_NUM; ++i) {
-        // check each 4 bytes word in the ipv4 header
-        uint32_t word = 0;
-        strncpy((char *)&word, ipv4_hdr + i * 4, 4);
-        word = ntohl(word) & bmi->drop_rule.ipv4_masks[i];
-        if (word != bmi->drop_rule.ipv4_vals[i]) {
-          // mismatch, disable the drop flag
-          drop_flag = 0;
-          break;
-        }
-      }
+    if (match_rule(&bmi->drop_rule, pkt_data, len)) {
+      return 0;
+    }
+  }
 
-      if (drop_flag) {
-        return 0;
-      }
+  if (bmi->delay_rule.valid && (bmi->delay_flags & 0x1 != 0)) {
+    // delay rule is valid and enabled for egress side, check the packet
+    if (match_rule(&bmi->delay_rule, pkt_data, len)) {
+      add_egress_delay_packet(bmi, pkt_data, len, bmi->delay_interval);
     }
   }
 
@@ -500,14 +568,34 @@ int bmi_interface_recv(bmi_interface_t *bmi, const char **data) {
   struct pcap_pkthdr *pkt_header;
   const unsigned char *pkt_data;
 
-  //TODO: check whether there is any delay packet expired
+  // check whether there is any expired packet; if so, read it first
+  struct timespec head_ts = get_head_ts(&bmi->ingress_delay_buffer);
+  struct timespec now;
+  clock_gettime(CLOCK_REALTIME, &now);
+  if ((head_ts.tv_nsec != 0 && head_ts.tv_sec != 0) && time_cmp(now, head_ts) >= 0) {
+    // the packet at the head has been expired, copy it out & delete
+    delay_pkt_t* head_pkt = get_head(&bmi->ingress_delay_buffer);
+    int len = head_pkt->len;
+    char *temp = malloc(len);
+    strncpy(temp, head_pkt, len);
+    delete_head_pkt(&bmi->ingress_delay_buffer);
+
+    // update timer
+    update_timer(&bmi->ingress_delay_buffer, bmi->ingress_timerid);
+    *data = temp;
+    return len;
+  }
 
   int retcode = pcap_next_ex(bmi->pcap, &pkt_header, &pkt_data);
   if(retcode == -2) {
-    //TODO: the ingress timer expired, handle that packet
-  }
-  else {
-    return -1;
+    // the receiver function was broken, get the head packet from delay buffer
+    delay_pkt_t temp = get_head(bmi->ingress_delay_buffer);
+    *data =  temp.data;
+
+    // update timer
+    update_timer(&bmi->ingress_delay_buffer, bmi->ingress_timerid);
+    
+    return temp.len;
   }
 
   if(pkt_header->caplen != pkt_header->len) {
@@ -521,28 +609,17 @@ int bmi_interface_recv(bmi_interface_t *bmi, const char **data) {
 
   if (bmi->drop_rule.valid) {
     // drop rule is valid, check the packet
-    uint16_t ether_type = 0;
-    strncpy((char *)&ether_type, pkt_data + (ETH_ALEN * 2), 2);
-    ether_type = ntohs(ether_type);
-    if (ether_type == ETH_P_IP) {
-      // ipv4 packet
-      const unsigned char *ipv4_hdr = pkt_data + (ETH_ALEN * 2) + 2;
-      int drop_flag = 1;
-      for (int i = 0; i < IPV4_4B_NUM; ++i) {
-        // check each 4 bytes word in the ipv4 header
-        uint32_t word = 0;
-        strncpy((char *)&word, ipv4_hdr + i * 4, 4);
-        word = ntohl(word) & bmi->drop_rule.ipv4_masks[i];
-        if (word != bmi->drop_rule.ipv4_vals[i]) {
-          // mismatch, disable the drop flag
-          drop_flag = 0;
-          break;
-        }
-      }
+    if (match_rule(&bmi->drop_rule, pkt_data, pkt_header->len)) {
+      return -1;
+    }
+  }
 
-      if (drop_flag) {
-        return -1;
-      }
+  if (bmi->delay_rule.valid && (bmi->delay_flags & 0x2 != 0)) {
+    // delay rule is valid and enabled for ingress side, check the packet
+    if (match_rule(&bmi->delay_rule, pkt_data, pkt_header->len)) {
+      add_ingress_delay_packet(bmi, pkt_data, pkt_header->len, bmi->delay_interval);
+
+      return -1;
     }
   }
 
