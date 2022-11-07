@@ -84,6 +84,9 @@ static void *run_select(void *data) {
   int max_fd;
   Word_t *pinfo;
 
+  struct sched_param params = { sched_get_priority_max(SCHED_RR) };
+  sched_setscheduler(0, SCHED_RR, &params);
+
   struct timeval timeout;
   while(1) {
     /* timeout is needed to update set */
@@ -254,8 +257,8 @@ static int _bmi_port_interface_add(bmi_port_mgr_t *port_mgr,
 
   port->ifname = strdup(ifname);
 
-  if (pcap_input_dump) bmi_interface_add_dumper(bmi, pcap_input_dump, 1);
-  if (pcap_output_dump) bmi_interface_add_dumper(bmi, pcap_output_dump, 0);
+  if (pcap_input_dump) bmi_interface_add_dumper(bmi, pcap_input_dump, 0);
+  if (pcap_output_dump) bmi_interface_add_dumper(bmi, pcap_output_dump, 1);
 
   port->bmi = bmi;
 
