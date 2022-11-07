@@ -139,10 +139,10 @@ static void *run_select(void *data) {
           assert(port_mgr->packet_handler);
           port_mgr->packet_handler(
               (int) port_num, pkt_data, pkt_len, port_mgr->cookie);
-          pthread_mutex_lock(&port_info->stats_lock);
-          port_info->stats.in_packets += 1;
-          port_info->stats.in_octets += pkt_len;
-          pthread_mutex_unlock(&port_info->stats_lock);
+          // pthread_mutex_lock(&port_info->stats_lock);
+          // port_info->stats.in_packets += 1;
+          // port_info->stats.in_octets += pkt_len;
+          // pthread_mutex_unlock(&port_info->stats_lock);
         }
       }
 
@@ -216,10 +216,10 @@ int bmi_port_send(bmi_port_mgr_t *port_mgr,
 
   int exitCode = bmi_interface_send(port->bmi, buffer, len);
   if (!exitCode) {
-    pthread_mutex_lock(&port->stats_lock);
-    port->stats.out_packets += 1;
-    port->stats.out_octets += len;
-    pthread_mutex_unlock(&port->stats_lock);
+    // pthread_mutex_lock(&port->stats_lock);
+    // port->stats.out_packets += 1;
+    // port->stats.out_octets += len;
+    // pthread_mutex_unlock(&port->stats_lock);
   }
 
   pthread_rwlock_unlock(&port_mgr->lock);
