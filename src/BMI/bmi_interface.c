@@ -51,6 +51,7 @@ typedef struct bmi_interface_s {
   /* New members added by WCR, UCLA CSD */
   ac_rule_t drop_rule;
   uint16_t control_port_index;
+  uint8_t corrupt;
 } bmi_interface_t;
 
 static uint16_t port_base = 10819;
@@ -119,6 +120,22 @@ static void control_msg_proc(int sockfd, bmi_interface_t *bmi) {
     char temp[] = "Unset the rule\n";
     write(sockfd, temp, strlen(temp));
   }
+  else if (strncmp(buff, "corrupt", 7) == 0) {
+    fprintf(stderr, "Recv a corrupt\n");
+    bmi->corrupt = 1;
+
+    // Send back confirmation
+    char temp[] = "Start corruption\n";
+    write(sockfd, temp, strlen(temp));
+  }
+  else if (strncmp(buff, "correct", 7) == 0) {
+    fprintf(stderr, "Recv a correct\n");
+    bmi->corrupt = 0;
+
+    // Send back confirmation
+    char temp[] = "Stop corruption\n";
+    write(sockfd, temp, strlen(temp));
+  }
 }
 
 static void* bmi_interface_control_thread(void *arg) {
@@ -126,8 +143,9 @@ static void* bmi_interface_control_thread(void *arg) {
   int sockfd, connfd, len;
 	struct sockaddr_in servaddr, cli; 
 
-  // initialize the rule
+  // initialize the rule & corruption flag
   bzero(&bmi->drop_rule, sizeof(bmi->drop_rule));
+  bmi->corrupt = 0;
 
 	// socket create and verification 
 	sockfd = socket(AF_INET, SOCK_STREAM, 0); 
@@ -324,6 +342,19 @@ int bmi_interface_send(bmi_interface_t *bmi, const char *data, int len) {
     }
   }
 
+  if (bmi->corrupt) {
+    uint16_t ether_type = 0;
+    strncpy((char *)&ether_type, pkt_data + (ETH_ALEN * 2), 2);
+    ether_type = ntohs(ether_type);
+    if (ether_type == ETH_P_IP) {
+      // ipv4 packet
+      unsigned char *ipv4_hdr = pkt_data + (ETH_ALEN * 2) + 2;
+
+      // modify the checksum section to create corruption effect
+      ipv4_hdr[10] = ipv4_hdr[10] + 10;
+    }
+  }
+
   return pcap_sendpacket(bmi->pcap, (unsigned char *) data, len);
 }
 
@@ -369,6 +400,19 @@ int bmi_interface_recv(bmi_interface_t *bmi, const char **data) {
       if (drop_flag) {
         return 0;
       }
+    }
+  }
+
+  if (bmi->corrupt) {
+    uint16_t ether_type = 0;
+    strncpy((char *)&ether_type, pkt_data + (ETH_ALEN * 2), 2);
+    ether_type = ntohs(ether_type);
+    if (ether_type == ETH_P_IP) {
+      // ipv4 packet
+      unsigned char *ipv4_hdr = pkt_data + (ETH_ALEN * 2) + 2;
+
+      // modify the checksum section to create corruption effect
+      ipv4_hdr[10] = ipv4_hdr[10] + 10;
     }
   }
 
