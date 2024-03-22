@@ -389,7 +389,9 @@ SimpleSwitch::transmit_thread() {
 
 ts_res
 SimpleSwitch::get_ts() const {
-  return duration_cast<ts_res>(clock::now() - start);
+  auto now = clock::now();
+  auto t_since_epoch = now.time_since_epoch();
+  return duration_cast<ts_res>(t_since_epoch);
 }
 
 void
